@@ -1,0 +1,464 @@
+---
+title: "Every Throw Counts"
+author: "Lindsay Whipple"
+date: "2023"
+output:
+  html_document:
+    theme: cosmo
+    highlight: tango
+    toc: true
+    toc_float: true
+    code_folding: show
+---
+
+## **Athletics needs a new breed of scouts and managers**
+
+
+```{r}
+# Load Libraries and Data
+library(readr)
+library(tidyverse)
+
+athletics <- read_csv("~/Desktop/GitHub Portfolio Projects/Athlete-Scouting-Analysis/athletics.csv")
+```
+
+```{r}
+# Filter to Women's Javelin
+jav <- athletics %>%
+  filter(Male_Female == "Female", Event == "Javelin") %>%
+  select(-Male_Female, -Event)
+jav <- jav %>%
+  mutate(Athlete = str_replace(Athlete, "Abigail Gomez Hernandez", "Abigail Gomez"))
+
+glimpse(jav)
+```
+```{r}
+# Understand the Data
+flights <- c("Flight1", "Flight2", "Flight3", "Flight4", "Flight5", "Flight6")
+
+zero_rates <- jav %>%
+  summarise(across(all_of(flights), ~ mean(. == 0))) %>%
+  pivot_longer(everything(), names_to = "Flight", values_to = "Zero Rate")
+
+print(zero_rates)
+```
+
+Zero rates are notably higher in Flights 3, 5, and 6. After Flight 3, the field is cut to the top performers, meaning late-flight zeros are often structural absences rather than failed throws. This distinction matters-- treating a missing late throw the same way as treating a foul would unfairly penalize athletes who were cut, thus inflating foul rates for strong performers who weren't present for those throws. 
+
+
+## **Reshape & Clean**
+
+```{r}
+# Reshape to Long Format
+jav_long <- jav %>%
+  pivot_longer(
+    cols = all_of(flights),
+    names_to = "Flight",
+    values_to = "Distance"
+  ) %>%
+  mutate(
+    Flight = as.numeric(str_remove(Flight, "Flight")),
+    is_foul = Distance == 0
+  )
+jav_long <- jav_long %>%
+  mutate(Athlete = str_replace(Athlete, "Abigail Gomez Hernandez", "Abigail Gomez"))
+
+head(jav_long)
+
+# Early/ Late Split
+jav <- jav %>%
+  mutate(
+    early = rowSums(across(c(Flight1, Flight2, Flight3), ~ ifelse(. == 0, NA, .)), na.rm = TRUE),
+    late = rowSums(across(c(Flight4, Flight5, Flight6), ~ ifelse(. == 0, NA, .)), na.rm = TRUE),
+    diff = late - early
+  )
+```
+
+In a traditional Javelin meet, a foul simply means that the throw does not count and the athlete still has five more. In this format, every throw is summed, so a foul results in a zero added to their team's total. An athlete who fouls on a third of their throws is a significant liability regardless of how far their best throw goes. This makes foul rate an important scouting metric that should be considered.
+
+## **Foul Rate Analysis**
+
+```{r}
+# Foul Rate by Athlete Analysis
+foul_rates <- jav_long %>%
+  group_by(Athlete) %>%
+  summarise(
+    total_throws = n(),
+    fouls = sum(is_foul),
+    foul_rate = round(fouls / total_throws, 3)
+  ) %>%
+  arrange(desc(foul_rate))
+
+print(foul_rates)
+```
+
+```{r}
+# Visualization
+foul_rates %>%
+  filter(total_throws >= 6) %>% 
+  slice(c(1:10, (n()-9):n())) %>%   # top and bottom 10
+  mutate(Athlete = fct_reorder(Athlete, foul_rate)) %>%
+  ggplot(aes(x = Athlete, y = foul_rate, fill = foul_rate)) +
+  geom_col() +
+  coord_flip() +
+  scale_fill_gradient(low = "#2ecc71", high = "#e74c3c") +
+  scale_y_continuous(labels = scales::percent) +
+  labs(
+    title = "Foul Rate by Athlete",
+    subtitle = "Min. 6 throws | Higher is worse.",
+    x = NULL,
+    y = "Foul Rate",
+    fill = "Foul Rate"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+```
+
+Shana Woods immediately stands out since she fouls on over 60% of her throws -- a critical liability in this format where every throw is summed. A cluster of athletes sits near 50%, suggesting more habitual rather than occasional fouling. At the other end, there are several athletes with no fouls at all across multiple meets, making them highly attractive picks even if their peak distances aren't the highest in the pool. 
+
+## **Per-Athlete Summary Stats**
+
+```{r}
+# Per-Athlete Summary Stats
+javelin_totals <- jav_long %>%
+  group_by(Athlete, EventID) %>%
+  summarise(
+    TotalDistance = sum(Distance[Distance > 0]),
+    SD = round(sd(Distance[Distance > 0]), 3),
+    Success = sum(Distance > 0),
+    FoulRate = round(mean(Distance == 0), 3),
+    .groups = "drop"
+  ) %>%
+  left_join(
+    select(jav, Athlete, EventID, diff),
+    by = c("Athlete", "EventID")
+  )
+
+head(javelin_totals, 10)
+```
+
+Each row represents one athlete at one meet. The same athlete appears multiple times if they competed in multiple meets. TotalDistance and SD are calculated on valid throws only-- including zeros would conflate fouling with poor performance, obscuring what each athlete actually does when they throw cleanly. 
+
+## **Aggregate & Normalize**
+
+```{r}
+# Aggregate Across Meets
+javelin_avg <- javelin_totals %>%
+  group_by(Athlete) %>%
+  summarise(
+    TotalDistance = mean(TotalDistance),
+    SD = mean(SD),
+    Success = mean(Success),
+    FoulRate = mean(FoulRate),
+    diff = mean(diff)
+  )
+
+# Normalize
+norm <- function(x) (x - min(x)) / (max(x) - min(x))
+
+javelin_norm <- javelin_avg %>%
+  mutate(
+    TotalDistance = norm(TotalDistance),
+    SD = norm(SD),
+    Success = norm(Success),
+    FoulRate = 1 - norm(FoulRate),  # invert, lower foul rate is better 
+    diff = norm(diff)
+  )
+
+head(javelin_norm)
+```
+
+Each stat is normalized to a 0-1 scale so they can be compared and combined. FoulRate is inverted so that a score of 1 means zero foul and 0 means the highest foul rate -- higher is always better across all five dimensions. Averaging across meets before normalizing means athletes with more meet appearances get a more stable estimate, which naturally rewards consistency over a standout single performance. 
+
+## **Weighting Philosophy**
+
+Not all stats contribute equally in a summed-distance format. Here's the reasoning behind each weight:
+
+- **TotalDistance (2.0)** -- the baseline. Throwing far matters, but it is not everything in a team format.
+
+- **FoulRate (3.0)** - the mosty heavily weighted stat. A foul is a direct zero added to the team total. Reliability beats peak performance when every throw counts. 
+
+- **Success (1.0)** - correlated with foul rate but captures something slightly different: an athlete who passes late throws scores low here even if they don't foul.
+
+- **diff (2.5)** - late-stage performance matters most. The manager chooses which two of three athletes continue after Flight 3, so athletes who improve late are disproportionately valuable. 
+
+- **SD (0.5)** - lowest weight because in this dataset consistency varies very little across athletes. It is included for completeness, but has limited discriminating power
+
+```{r}
+# Apply Weights and Select Top 5
+weights <- c (
+  TotalDistance = 2.0,
+  SD = 0.5,
+  Success = 1.0,
+  FoulRate = 3.0,
+  diff = 2.5
+)
+
+javelin_team <- javelin_norm %>%
+  mutate(
+    TotalScore = TotalDistance * weights["TotalDistance"] +
+      SD * weights["SD"] +
+      Success * weights["Success"] +
+      FoulRate * weights["FoulRate"] +
+      diff * weights["diff"]
+  ) %>%
+  arrange(desc(TotalScore)) %>%
+  slice(1:5) %>%
+  select(Athlete, TotalScore)
+
+print(javelin_team)
+```
+
+The top five are defined almost entirely by their foul rate -- all five recorded zero fouls across their meets, and given the 3.0 weight on that stat, clean throwing becomes the primary qualification. One athlete that stands out is Alicia DeShasier. She has some of the best raw distance scores of the bunch, but missed the cut due to occasional fouls. 
+
+## **Know Your Players**
+
+```{r}
+# Pull Stats for Selected Athletes
+team_athletes <- javelin_team$Athlete
+
+team_stats <- javelin_avg %>%
+  filter(Athlete %in% team_athletes) %>%
+  mutate(Group = "Selected")
+
+pool_stats <- javelin_avg %>%
+  summarise(
+    TotalDistance = mean(TotalDistance),
+    SD = mean(SD),
+    Success = mean(Success),
+    FoulRate = mean(FoulRate),
+    diff = mean(diff)
+  ) %>%
+  mutate(Athlete = "Pool Average", Group = "Pool")
+
+top_stats <-javelin_avg %>%
+  summarise(
+    TotalDistance = max(TotalDistance),
+    SD = mean(SD),
+    Success = mean(Success),
+    FoulRate = min(FoulRate),
+    diff = max(diff)
+  ) %>%
+  mutate(Athlete = "Pool Best", Group = "Pool")
+
+comparison <- bind_rows(team_stats, pool_stats, top_stats)
+```
+
+
+```{r}
+# Visualization
+comparison %>%
+  pivot_longer(
+    cols = c(TotalDistance, SD, Success, FoulRate, diff),
+    names_to = "Stat",
+    values_to = "Value"
+  ) %>%
+  mutate(Value = ifelse(Stat == "FoulRate", 1 - Value, Value),
+         Stat = ifelse(Stat == "FoulRate", "CleanRate", Stat)
+  ) %>% 
+  filter(Group == "Selected") %>%
+  ggplot(aes(x = Athlete, y = Value, fill = Athlete)) +
+  geom_col() +
+  geom_hline(
+    data = comparison %>%
+      filter(Group == "Pool") %>%
+      pivot_longer(cols = c(TotalDistance, SD, Success, FoulRate, diff), names_to = "Stat", values_to = "Value") %>%
+      mutate(
+        Value = ifelse(Stat == "FoulRate", 1 - Value, Value),
+        Stat = ifelse(Stat == "FoulRate", "CleanRate", Stat)
+      ),
+    aes(yintercept = Value, linetype = Athlete),
+    color = "black", linewidth = 0.6
+  ) +
+  facet_wrap(~ Stat, scales = "free_y") +
+  scale_fill_brewer(palette = "Set2") +
+  labs(
+    title = "Selected Athletes vs. The Pool",
+    subtitle = "Dashed lines indicate pool average and best.",
+    x = NULL, y = NULL,
+    fill = "Athlete",
+    linetype = "Benchmark"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_blank(),
+    legend.position = "bottom"
+  )
+```
+
+**CleanRate** All five at 1.0, above the pool average of ~0/75.
+
+**TotalDistance** All above pool average, with Dominique Ouellette closest to the pool best. 
+
+**Success** All at 6, meaning every athlete completed all their throws across their meets. 
+
+**SD** Madalaine Stulce is an outlier here, she has the most throw-to-throw variance of them all.
+
+**diff** Modest, but positive for everyone except Diana Sammai Martinex who is essentially flat, however all are above the pool average line. 
+
+
+## **Simulating a Match**
+Running 1,000 simulations gives us a lot more meaning than a single simulated match. It gives us a win probability, which is a more realistic and useful number. Each simulation:
+
+-- Picks three starters from the selected five.
+
+-- Draw a random opponent lineup from the remaining athlete pool.
+
+-- Sample each athlete's throws from their historical distribution.
+
+-- Sum all valid throws for each team and compare. 
+
+```{r}
+set.seed(42)
+n_sims <- 1000
+
+# Throw distribution per athlete from historical data
+throw_distributions <- jav_long %>%
+  filter(Distance > 0) %>%
+  group_by(Athlete) %>%
+  summarise(throws = list(Distance), .groups = "drop")
+
+# Simulate one athlete's 6 throws
+simulate_athlete <- function(athlete_name, n_throws = 6) {
+  throws <- throw_distributions %>%
+    filter(Athlete == athlete_name) %>%
+    pull(throws) %>%
+    .[[1]]
+  sum(sample(throws, n_throws, replace = TRUE))
+}
+
+# Starting three -- best diff scores from selected five
+home_team <- c("Diana Sammai Martinez", "Rebecka Anderson", "Dominique Ouellette")
+
+# Pool of possible opponents
+opponent_pool <- javelin_avg %>%
+  filter(!Athlete %in% team_athletes) %>%
+  pull(Athlete)
+
+# Run the simulations
+results <- replicate(n_sims, {
+  # sample opponent lineup
+  away_team <- sample(opponent_pool, 3, replace = FALSE)
+  
+  # simulate total distance for each team
+  home_score <- sum(sapply(home_team, simulate_athlete))
+  away_score <- sum(sapply(away_team, simulate_athlete))
+  
+  home_score - away_score
+})
+
+# Summaries
+win_prob <- mean(results > 0)
+avg_margin <- round(mean(results), 2)
+
+cat(sprintf("Win Probability: %.1f%%\n", win_prob * 100))
+cat(sprintf("Average Margin: %.2fm\n", avg_margin))
+```
+
+```{r}
+# Visualization
+data.frame(margin = results) %>%
+  ggplot(aes(x = margin, fill = margin > 0)) +
+  geom_histogram(bins = 50, color = "white", linewidth = 0.2) +
+  geom_vline(xintercept = 0, linewidth = 1, linetype = "dashed") +
+  scale_fill_manual(
+    values = c("#e74c3c", "#2ecc71"),
+    labels = c("Loss", "Win")
+  ) +
+  labs(
+    title = "Match Simulation Results (n = 1,000)",
+    subtitle = "Score margin distribution vs. random opponent lineups",
+    x = "Score Margin (meters)", 
+    y = "Count",
+    fill = NULL
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+This selected team wins just 24.6% of simulated matches against random opponent lineups, with an average losing margin of 42.6 meters. This is a direct consequence of the weighting philosophy, by heavily prioritising fould rate, we selected reliable but modest throwers, sacrificing the raw distance needed to outscore stronger opponents. 
+
+A manager building a full roster across multiple events might deliberately pick reliable atheltes in javelin to anchor the team, while targeting high-ceiling throwers in other events. But it does illustrate a core tension in any scouting framework: reliability and peak performance are rarely found in the same athlete. 
+
+```{r}
+# What if we prioritized distance over foul rate?
+aggressive_weights <- c(
+  TotalDistance = 4.0,
+  SD = 0.5,
+  Success = 1.0,
+  FoulRate = 1.5,
+  diff = 2.5
+)
+
+aggressive_team <- javelin_norm %>%
+  mutate(
+    TotalScore = TotalDistance * aggressive_weights["TotalDistance"] +
+      SD * aggressive_weights["SD"] +
+      Success * aggressive_weights["Success"] +
+      FoulRate * aggressive_weights["FoulRate"] +
+      diff * aggressive_weights["diff"]
+  ) %>%
+  arrange(desc(TotalScore)) %>%
+  slice(1:3) %>%
+  pull(Athlete)
+
+# Simulate with aggressive team
+aggressive_results <- replicate(n_sims, {
+  away_team <- sample(opponent_pool, 3, replace = FALSE)
+  home_score <- sum(sapply(aggressive_team, simulate_athlete))
+  away_score <- sum(sapply(away_team, simulate_athlete))
+  home_score - away_score
+})
+
+cat("Conservative Team Win Rate:", sprintf("%.1f%%\n", mean(results > 0) * 100))
+cat("Aggressive Team Win Rate:", sprintf("%.1f%%\n", mean(aggressive_results > 0) * 100))
+```
+
+This is a striking gap and it shows us that shifting weight toward total distance lifts the win rate from 24.6% to 97.5%. This suggests that in this particular athlete pool, distance is so dominant that a reliability-first strategy is simply noncompetitive. A team of clean but modest throwers will lose to a team of big throwers who foul occasionally, because the distance advantage outweighs the foul penalty. 
+
+This does not, however, mean foul rate is unimportant, it means the weights need to reflect the actual distribution of the athlete pool being drawn from. In a pool where distances are more compressed, reliability would matter more. The framework is sound; the inputs need calibration to context. 
+
+```{r}
+data.frame(
+  margin = c(results, aggressive_results),
+  strategy = rep(c("Conservative", "Aggressive"), each = n_sims)
+) %>%
+  ggplot(aes(x = margin, fill = margin > 0)) +
+  geom_histogram(bins = 50, color = "white", linewidth = 0.2) +
+  geom_vline(xintercept = 0, linewidth = 1, linetype = "dashed") +
+  facet_wrap(~ strategy) +
+  scale_fill_manual(
+    values = c("#e74c3c", "#2ecc71"),
+    labels = c("Loss", "Win")
+  ) +
+  labs(
+    title = "Conservative vs. Aggressive Weighting Strategy",
+    subtitle = "1,000 simulations each vs. random opponent lineups",
+    x = "Score Margin (meters)",
+    y = "Count",
+    fill = NULL
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+```
+
+
+## **Conclusion**
+
+This analysis set out to answer a simple question: if javelin was a team sport where every throw is summed, how would you scout and select a roster? The answer suggests that it is slightly more nuanced than traditional track and field metrics would suggest.
+
+Foul rate is an unappreciated stat in this format. In a traditional meet, a foul means that the throw doesn't count -- in a summed format, that is a direct zero added to your team's total. Athletes who habitually are a liability regardless of how far their best throw goes. 
+
+I conducted a conservative vs. aggressive simulation, which revealed something important about this specific athlete pool: distances vary enough between athletes that raw throwing ability dominates reliability as a selection criterion. A team of perfect, but modest, throwers loses badly to a team of big throwers who occasionally foul. This, however, does not invalidate the reliability framework-- it tells us the weights need to be calibrated to the competitive context. 
+
+Finally, here is what I would do if I was given more data:
+
+-- Opponent Scouting: Right now the simulation draws random opponent lineups. In a real league, you'd know your opponents in advance and could optimize your lineup against theirs specifically. 
+
+-- Event-Level Fatigue: Do athletes throw shorter in later meets of a season? The data has EventIDs, but no dates, so this couldn't be explored here. 
+
+-- Cross-Event Roster Building: This analysis covers women's javelin only. A full team needs athletes across throws and jumps, and the budget constraints of signing athletes would force real tradeoffs across events.
+
+-- Better Foul Modeling: Here, I treated all zeros as equivalent, but a fould on throw 1 is very different strategically from a foul on throw 6. A more granular model would weight foul position as well as foul frequency.
